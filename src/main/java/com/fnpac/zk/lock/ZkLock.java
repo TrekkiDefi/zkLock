@@ -33,6 +33,8 @@ import java.util.concurrent.TimeUnit;
  * <p>
  * 写：<br>
  * /{namespace}/SharedLock/{lockKey}/W{UUID}00000000<br>
+ * <p>
+ * 每次获取锁，切记重新new ZkLock()，ZkLock对象请勿重复使用于获取锁。
  */
 public class ZkLock {
 
@@ -41,14 +43,13 @@ public class ZkLock {
     /**
      * Global static variable
      */
-    private static CuratorFramework client = null;
     private static final String ExclusiveLock = "ExclusiveLock";// 排他锁目录
     private static final String SharedLock = "SharedLock";// 共享锁目录
-    private static final String Lock = "Lock";
 
     /**
      * Current lock variable
      */
+    private CuratorFramework client = null;
     private CountDownLatch latch = new CountDownLatch(1);
     private final String lockKey;// 当前锁的Key
     private final Long timeout;// 超时等待时间
@@ -83,13 +84,6 @@ public class ZkLock {
 
         // 创建zookeeper客户端连接，并初始化排他锁目录和共享锁目录
         init(connectString, namespace);
-
-        // 添加排他锁watcher
-        try {
-            addChildWatcher(ExclusiveLock, this.lockKey);
-        } catch (Exception e) {
-            throw new RuntimeException(e.getMessage(), e.getCause());
-        }
     }
 
     /**
@@ -98,7 +92,7 @@ public class ZkLock {
      * @param connectString zookeeper连接地址
      * @param namespace     命名空间
      */
-    private static synchronized void init(String connectString, String namespace) {
+    private void init(String connectString, String namespace) {
         if (client != null)
             return;
 
@@ -132,13 +126,13 @@ public class ZkLock {
     /**
      * 监听当前锁的子节点的创建、删除、节点数据变化
      *
-     * @param lockDir 锁目录
-     * @param lockKey 当前锁的Key
+     * @param watcheNode 监听节点
+     * @param lockKey    当前锁的Key
      * @throws Exception
      */
-    private void addChildWatcher(String lockDir, final String lockKey) throws Exception {
+    private PathChildrenCache addChildWatcher(String watcheNode, final String lockKey) throws Exception {
         // 监听当前锁的子节点的创建、删除、节点数据变化
-        final PathChildrenCache cache = new PathChildrenCache(client, "/" + lockDir + "/" + lockKey,
+        final PathChildrenCache cache = new PathChildrenCache(client, watcheNode,
                 true);
         cache.start(PathChildrenCache.StartMode.POST_INITIALIZED_EVENT);
 
@@ -172,12 +166,11 @@ public class ZkLock {
 
                         boolean isLock = false;
                         if (selfIdentity.startsWith("R")) {
-                            isLock = canGetLock(lockChildrens, 0, true);
+                            isLock = canGetLock(lockChildrens, 0);
                         } else if (selfIdentity.startsWith("W")) {
-                            isLock = canGetLock(lockChildrens, 1, true);
+                            isLock = canGetLock(lockChildrens, 1);
                         }
 
-                        logger.info("收到共享锁释放通知后，重新尝试获取锁，结果为:" + isLock);
                         if (isLock) {
                             //获得锁
                             logger.info("获得共享锁，解除因为获取不到锁的阻塞");
@@ -190,6 +183,7 @@ public class ZkLock {
                 }
             }
         });
+        return cache;
     }
 
     /**
@@ -198,21 +192,40 @@ public class ZkLock {
      * 排他锁采用的是循环阻塞获取锁的方式
      */
     public boolean getExclusiveLock() {
+
+        // 添加排他锁watcher监听
+        PathChildrenCache cache = null;
+        int curTimes = 0;
         while (true) {
             try {
                 client.create().creatingParentsIfNeeded()
                         .withMode(CreateMode.EPHEMERAL)
                         .withACL(ZooDefs.Ids.OPEN_ACL_UNSAFE)
-                        .forPath("/" + ExclusiveLock + "/" + this.lockKey + "/" + Lock);
+                        .forPath("/" + ExclusiveLock + "/" + this.lockKey);
 
                 logger.info("获取排他锁成功");
+
+                // 获取锁成功，删除watcher监听
+                if (cache != null) {
+                    cache.close();
+                }
+
                 return true;// 如果节点创建成功，即说明获取排他锁成功，返回true
             } catch (Exception e) {
                 logger.info("获取排他锁失败");
                 // 如果没有获取到排他锁，需要重新设置同步资源值
-                if (latch.getCount() <= 0) {
+                if (latch.getCount() != 1) {
                     latch = new CountDownLatch(1);
                 }
+
+                if (curTimes == 0) {// 设置watcher监听
+                    try {
+                        cache = addChildWatcher("/" + ExclusiveLock, this.lockKey);
+                    } catch (Exception ie) {
+                        throw new RuntimeException(e.getMessage(), e.getCause());
+                    }
+                }
+
                 try {
                     boolean rs = latch.await(this.timeout, TimeUnit.MILLISECONDS);
                     if (!rs) {// false，等待超时
@@ -224,6 +237,8 @@ public class ZkLock {
                     return false;
                 }
             }
+
+            ++curTimes;
         }
     }
 
@@ -234,6 +249,7 @@ public class ZkLock {
      */
     public boolean unlockForExclusive() {
         try {
+            logger.info("执行释放排他锁，lockKey:" + this.lockKey);
             if (client.checkExists().forPath("/" + ExclusiveLock + "/" + this.lockKey) != null) {
                 client.delete().deletingChildrenIfNeeded().forPath("/" + ExclusiveLock + "/" + this.lockKey);
             }
@@ -295,16 +311,30 @@ public class ZkLock {
 
             List<String> lockChildrens = client.getChildren().forPath(
                     "/" + SharedLock + "/" + this.lockKey);// 获取当前共享锁下所有的读些锁
-            if (!canGetLock(lockChildrens, lockType.ordinal(), false)) {
+
+            PathChildrenCache cache = null;
+            if (!canGetLock(lockChildrens, lockType.ordinal())) {
+
+                // 第一次请求获取锁则设置监听，以后就不设置了，因为监听一直存在
+                // 共享锁监听当前lockKey节点
+                cache = addChildWatcher("/" + SharedLock + "/" + this.lockKey, this.lockKey);
+
                 shardLocklatch.await();
             }
+
+            logger.info("获取共享锁成功");
+
+            // 获取锁成功，删除监听
+            if (cache != null) {
+                cache.close();
+            }
+
+            return true;
         } catch (Exception e) {
             logger.error("获取共享锁出错", e);
             e.printStackTrace();
             return false;
         }
-        logger.info("获取共享锁成功");
-        return true;
     }
 
     /**
@@ -314,6 +344,7 @@ public class ZkLock {
      */
     public boolean unlockForShardLock() {
         try {
+            logger.info("执行释放共享锁，lockKey:" + this.lockKey + ", selfNodeName" + this.selfNodeName);
             if (client.checkExists().forPath(selfNodeName) != null) {
                 client.delete().forPath(selfNodeName);
             }
@@ -333,65 +364,53 @@ public class ZkLock {
         return true;
     }
 
-    private boolean canGetLock(List<String> childrens, int type, boolean reps) {
+    private boolean canGetLock(List<String> childrens, int type) {
         if (childrens.size() == 0)// 没有其他读写锁，获取锁成功
             return true;
 
-        try {
-            String currentSeq = null;
-            List<String> sortSeqs = new ArrayList<String>();
-            Map<String, String> seqs_identitys = new HashMap<String, String>();
-            for (String child : childrens) {
-                String splits[] = child.split("@");
-                sortSeqs.add(splits[1]);// 节点序号，eg，00000000 00000001 00000002
+        String currentSeq = null;
+        List<String> sortSeqs = new ArrayList<String>();
+        Map<String, String> seqs_identitys = new HashMap<String, String>();
+        for (String child : childrens) {
+            String splits[] = child.split("@");
+            sortSeqs.add(splits[1]);// 节点序号，eg，00000000 00000001 00000002
 
-                seqs_identitys.put(splits[1], splits[0]);
+            seqs_identitys.put(splits[1], splits[0]);
 
-                if (this.selfIdentity.equals(splits[0]))
-                    currentSeq = splits[1];
-            }
+            if (this.selfIdentity.equals(splits[0]))
+                currentSeq = splits[1];
+        }
 
-            Collections.sort(sortSeqs);
+        Collections.sort(sortSeqs);
 
-            if (currentSeq.equals(sortSeqs.get(0))) {// 当前节点是第一个节点，则无论是读锁还是写锁都可以获取
-                logger.info("获取共享锁成功，因为是第一个获取锁的请求，所以获取成功");
-                return true;
-            } else {// 当前节点不是第一个节点
-                if (type == 1) {// 写锁
-                    // 第一次请求获取锁则设置监听，以后就不设置了，因为监听一直存在
-                    if (!reps)
-                        addChildWatcher(SharedLock, this.lockKey);
-                    logger.info("获取共享写锁失败，因为前面有其它读写锁，所以获取失败");
-                    return false;
-                } else if (type == 0) {// 读锁
+        if (currentSeq.equals(sortSeqs.get(0))) {// 当前节点是第一个节点，则无论是读锁还是写锁都可以获取
+            logger.info("获取共享锁成功，因为是第一个获取锁的请求，所以获取成功");
+            return true;
+        } else {// 当前节点不是第一个节点
+            if (type == 1) {// 写锁
+                logger.info("获取共享写锁失败，因为前面有其它读写锁，所以获取失败");
+                return false;
+            } else {// 读锁
 
-                    boolean hasW = false;
-                    for (String seq : sortSeqs) {
-                        if (seq.equals(currentSeq)) {
-                            break;
-                        }
-                        if (seqs_identitys.get(seq).startsWith("W")) {
-                            hasW = true;
-                            break;
-                        }
+                boolean hasW = false;
+                for (String seq : sortSeqs) {
+                    if (seq.equals(currentSeq)) {
+                        break;
                     }
-
-                    if (!hasW) {// 前面不存在写锁，获取锁成功
-                        return true;
-                    } else {// 前面存在写锁，需要等待
-                        // 第一次请求获取锁则设置监听，以后就不设置了，因为监听一直存在
-                        if (!reps)
-                            addChildWatcher(SharedLock, this.lockKey);
-                        logger.info("获取共享读锁失败，因为前面有其它写锁，所以获取失败");
-                        return false;
+                    if (seqs_identitys.get(seq).startsWith("W")) {
+                        hasW = true;
+                        break;
                     }
                 }
-            }
 
-        } catch (Exception e) {
-            e.printStackTrace();
+                if (!hasW) {// 前面不存在写锁，获取锁成功
+                    return true;
+                } else {// 前面存在写锁，需要等待
+                    logger.info("获取共享读锁失败，因为前面有其它写锁，所以获取失败");
+                    return false;
+                }
+            }
         }
-        return false;
     }
 
     public enum SharedLockType {
